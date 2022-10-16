@@ -16,11 +16,10 @@ use walkdir::WalkDir;
 
 use crate::module::{imports_to_uses, module_as_binding};
 use crate::ty::wasm_abi_set;
-use crate::util::{CollectPubs, SysUseAdder, WasmAbify};
+use crate::util::{BindingsCleaner, CollectPubs, SysUseAdder, WasmAbify};
 
 mod decl;
 mod func;
-mod import;
 mod module;
 mod pat;
 mod ty;
@@ -72,11 +71,6 @@ fn main() -> std::io::Result<()> {
                 .or_default()
                 .insert(filename.to_string());
             new_path.push(format!("{filename}.rs",));
-            let js_path = {
-                let mut path_to_js = entry.path().strip_prefix(&crate_path).unwrap().to_owned();
-                path_to_js.pop();
-                format!("/{}/{filename}.js", path_to_js.display())
-            };
             let mut f = File::create(&new_path).unwrap();
 
             let cm: Lrc<SourceMap> = Default::default();
@@ -115,7 +109,12 @@ fn main() -> std::io::Result<()> {
             };
 
             let uses = imports_to_uses(&module.body);
-            let mut module_items = module_as_binding(&js_path, &module.body);
+            let mut module_items = module_as_binding(&module.body, None);
+
+            let mut cleaner = BindingsCleaner;
+            module_items
+                .iter_mut()
+                .for_each(|i| cleaner.visit_item_mut(i));
 
             let mut pubs = CollectPubs::default();
             module_items.iter().for_each(|i| pubs.visit_item(i));
@@ -129,7 +128,6 @@ fn main() -> std::io::Result<()> {
             module_items
                 .iter_mut()
                 .for_each(|i| abify.visit_item_mut(i));
-
             let mut adder = SysUseAdder {
                 pubs: pubs.0,
                 uses: HashSet::default(),

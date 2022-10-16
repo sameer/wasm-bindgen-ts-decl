@@ -3,18 +3,21 @@ use std::collections::HashMap;
 use swc_ecma_ast::{
     Decl, ExportDecl, ExportDefaultExpr, ExportDefaultSpecifier, ExportNamedSpecifier,
     ExportSpecifier, Ident, ImportDecl, ImportDefaultSpecifier, ImportNamedSpecifier,
-    ImportSpecifier, ModuleDecl, ModuleExportName, ModuleItem, NamedExport, Stmt, TsModuleName,
+    ImportSpecifier, ModuleDecl, ModuleExportName, ModuleItem, NamedExport, Stmt,
+    TsNamespaceExportDecl,
 };
 use syn::{
     parse_quote,
     punctuated::Punctuated,
     token::{Brace, Comma},
-    ForeignItem, ForeignItemType, Item, ItemForeignMod, ItemUse, Token, UseGroup, UsePath, UseTree,
+    visit_mut::VisitMut,
+    Expr, ExprArray, ExprAssign, ForeignItem, Item, ItemForeignMod, ItemUse, Token, UseGroup,
+    UsePath, UseTree,
 };
 
 use crate::{
-    decl::{decl_ident, decl_to_items},
-    util::{import_prefix_to_idents, sanitize_sym},
+    decl::{decl_ident, decl_to_items, ts_module_to_binding},
+    util::{import_prefix_to_idents, sanitize_sym, ModuleBindingsCleaner},
 };
 
 pub fn imports_to_uses(body: &[ModuleItem]) -> Vec<ItemUse> {
@@ -157,36 +160,58 @@ fn use_path_to_use_tree(mut prefix: Vec<syn::Ident>, leaf: UseTree) -> UseTree {
     tree
 }
 
-pub fn module_as_binding(module_path: &str, body: &[ModuleItem]) -> Vec<Item> {
+/// Converts a JS module to an extern binding
+///
+/// If this is a namespace, assume everything inside it is exported.
+pub fn module_as_binding(body: &[ModuleItem], namespace: Option<&str>) -> Vec<Item> {
+    let mut items = vec![];
+
+    let mut enclosing_ns: Option<&str> = None;
     let mut foreign_items = vec![];
     let mut default_ident = None;
     let mut declared_bodies: HashMap<String, &Decl> = HashMap::new();
     for item in body {
         match item {
-            ModuleItem::Stmt(Stmt::Decl(decl)) => {
+            ModuleItem::Stmt(Stmt::Decl(decl)) if namespace.is_none() => {
                 if let Some(ident) = decl_ident(decl) {
                     declared_bodies.insert(ident.to_string(), decl);
                 }
             }
-            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl { decl, .. })) => {
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
+                decl: Decl::TsModule(tsm),
+                ..
+            }))
+            | ModuleItem::Stmt(Stmt::Decl(Decl::TsModule(tsm))) => {
+                let mod_extern = ts_module_to_binding(&tsm);
+                items.extend(mod_extern.into_iter());
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl { decl, .. }))
+            | ModuleItem::Stmt(Stmt::Decl(decl)) => {
                 let mut decl_foreign_items = decl_to_items(decl);
                 foreign_items.append(&mut decl_foreign_items);
             }
-            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export_default)) => {
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export_default))
+                if namespace.is_none() =>
+            {
                 default_ident = export_default.expr.as_ident().map(|i| i.sym.to_string());
                 continue;
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::TsNamespaceExport(TsNamespaceExportDecl {
+                id: Ident { sym, .. },
+                ..
+            })) => enclosing_ns = Some(sym),
+            ModuleItem::Stmt(_) => {
+                eprintln!("Didn't expect non decl statement");
             }
             ModuleItem::ModuleDecl(
                 ModuleDecl::ExportNamed(_)
                 | ModuleDecl::Import(_)
                 | ModuleDecl::TsImportEquals(_)
                 | ModuleDecl::ExportDefaultDecl(_)
-                | ModuleDecl::ExportAll(_),
+                | ModuleDecl::ExportAll(_)
+                | ModuleDecl::ExportDefaultExpr(_)
+                | ModuleDecl::TsExportAssignment(_),
             ) => {}
-            ModuleItem::ModuleDecl(_) => todo!("{item:?}"),
-            _ => {
-                eprintln!("Unknown");
-            }
         }
     }
 
@@ -195,58 +220,70 @@ pub fn module_as_binding(module_path: &str, body: &[ModuleItem]) -> Vec<Item> {
         foreign_items.append(&mut decl_foreign_items);
     }
 
-    // Hydrate implicit namespaces
-    for decl in body
-        .iter()
-        .filter_map(|i| match i {
-            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl { decl, .. })) => Some(decl),
-            _ => None,
-        })
-        .chain(
-            default_ident
-                .as_ref()
-                .and_then(|i| declared_bodies.get(i))
-                .iter()
-                .map(|d| **d),
-        )
-    {
-        if let Decl::TsModule(module) = decl {
-            let raw_name: &str = match &module.id {
-                TsModuleName::Ident(i) => &i.sym,
-                TsModuleName::Str(s) => &s.value,
-            };
-            let name = sanitize_sym(raw_name);
-            let exists = foreign_items.iter().any(|item| match item {
-                ForeignItem::Type(ForeignItemType { ident, .. }) => *ident == name,
-                _ => false,
+    let mut dedupe = ModuleBindingsCleaner::default();
+    foreign_items
+        .iter_mut()
+        .for_each(|i| dedupe.visit_foreign_item_mut(i));
+
+    if !foreign_items.is_empty() {
+        if namespace.is_some() {
+            items.push(parse_quote! {
+                use super::*;
             });
-
-            if !exists {
-                let mut ty: ForeignItemType = parse_quote! {
-                    pub type #name;
-                };
-                if name != raw_name {
-                    ty.attrs
-                        .push(parse_quote!(#[wasm_bindgen(js_name = #raw_name)]));
-                }
-                foreign_items.push(ty.into());
-            }
-        }
-    }
-
-    if foreign_items.is_empty() {
-        vec![]
-    } else {
-        vec![
-            parse_quote! {
+        } else {
+            items.push(parse_quote! {
                 use wasm_bindgen::prelude::wasm_bindgen;
-            },
-            Item::ForeignMod(ItemForeignMod {
-                attrs: vec![parse_quote!(#[wasm_bindgen(module = #module_path)])],
+            });
+        }
+
+        items.push(
+            ItemForeignMod {
+                attrs: vec![parse_quote!(#[wasm_bindgen])],
                 abi: parse_quote!(extern "C"),
                 brace_token: Brace::default(),
                 items: foreign_items,
-            }),
-        ]
+            }
+            .into(),
+        );
+    }
+
+    if let Some(ns) = namespace.or(enclosing_ns) {
+        let mut ans = ApplyNamespace(ns.to_string());
+        items.iter_mut().for_each(|i| ans.visit_item_mut(i));
+    }
+
+    items
+}
+
+struct ApplyNamespace(String);
+
+impl VisitMut for ApplyNamespace {
+    fn visit_foreign_item_mut(&mut self, fi: &mut ForeignItem) {
+        let attrs = match fi {
+            ForeignItem::Fn(f) => &mut f.attrs,
+            ForeignItem::Static(s) => &mut s.attrs,
+            ForeignItem::Type(t) => &mut t.attrs,
+            _ => todo!(),
+        };
+        let ns = &self.0;
+        if let Some((attr, mut array)) = attrs.iter_mut().find_map(|attr| {
+            if attr.path.get_ident() == Some(&parse_quote!(wasm_bindgen)) {
+                if let Ok(ExprAssign { left, right, .. }) = attr.parse_args::<ExprAssign>() {
+                    if left == parse_quote!(js_namespace) {
+                        if let Expr::Array(arr @ ExprArray { .. }) = *right {
+                            return Some((attr, arr));
+                        }
+                    }
+                }
+            }
+            None
+        }) {
+            array.elems.insert(0, parse_quote!(#ns));
+            *attr = parse_quote! {
+                #[wasm_bindgen(js_namespace = #array)]
+            };
+        } else {
+            attrs.push(parse_quote!(#[wasm_bindgen(js_namespace = [#ns])]))
+        }
     }
 }

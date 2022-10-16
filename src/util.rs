@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 
 use lazy_static::lazy_static;
+use swc_ecma_ast::TsTypeParamDecl;
 use syn::{
     parse_quote, parse_str, punctuated::Punctuated, token::Colon2, visit::Visit,
     visit_mut::VisitMut, AngleBracketedGenericArguments, Attribute, Expr, ExprAssign, ExprPath,
-    ForeignItem, GenericArgument, Ident, ItemUse, PathArguments, PathSegment, Token, Type,
-    TypePath,
+    FnArg, ForeignItem, GenericArgument, Ident, ItemUse, PatType, PathArguments, PathSegment,
+    ReturnType, Token, Type, TypePath, TypeReference, TypeSlice, UseName, UseRename,
 };
 
 /// Makes a JS ident a valid Rust ident.
@@ -83,12 +84,11 @@ pub fn import_path_to_type_path_prefix(path: &str) -> Punctuated<PathSegment, Co
 }
 
 /// Various binding cleanup steps:
-/// * Remove generics
 /// * Remove unnecessary parentheses around types
 /// * Flatten `Option<Option<_>>`
 /// * Replace known TypeScript string union types with string
 /// * Make `Option<JsValue>` `JsValue`
-pub struct BindingsCleaner(pub Vec<Ident>);
+pub struct BindingsCleaner;
 
 impl VisitMut for BindingsCleaner {
     fn visit_type_mut(&mut self, t: &mut Type) {
@@ -129,10 +129,11 @@ impl VisitMut for BindingsCleaner {
                         },
                     )) = args.first().unwrap()
                     {
-                        if inner_path.leading_colon.is_some()
-                            && inner_path.segments.last().unwrap().ident == "Option"
-                        {
-                            *t = inner.clone();
+                        if inner_path.leading_colon.is_some() {
+                            let last = &inner_path.segments.last().unwrap().ident;
+                            if last == "Option" || last == "JsValue" {
+                                *t = inner.clone();
+                            }
                         }
                     }
                 }
@@ -140,9 +141,7 @@ impl VisitMut for BindingsCleaner {
         } else if t.path.segments.len() == 1 {
             let seg = t.path.segments.first_mut().unwrap();
             let seg_ident_string = seg.ident.to_string();
-            if seg.arguments.is_empty() && self.0.contains(&seg.ident) {
-                *t = parse_quote!(::wasm_bindgen::JsValue);
-            } else if KNOWN_STRING_TYPES.contains(&seg_ident_string.as_str()) {
+            if KNOWN_STRING_TYPES.contains(&seg_ident_string.as_str()) {
                 *t = parse_quote!(::std::string::String);
             }
         }
@@ -153,16 +152,122 @@ impl VisitMut for BindingsCleaner {
     }
 }
 
+/// Removes the given generics
+pub struct ByeByeGenerics(pub Vec<Ident>);
+
+impl ByeByeGenerics {
+    pub fn new<'a>(args: impl Iterator<Item = &'a Box<TsTypeParamDecl>>) -> Self {
+        Self(
+            args.flat_map(|tp| tp.params.iter())
+                .map(|t| sanitize_sym(&t.name.sym))
+                .collect(),
+        )
+    }
+
+    pub fn join(mut self, other: &Self) -> Self {
+        self.0.extend(other.0.iter().cloned());
+        Self(self.0)
+    }
+}
+
+impl VisitMut for ByeByeGenerics {
+    fn visit_type_path_mut(&mut self, t: &mut TypePath) {
+        if t.path.segments.len() == 1 {
+            let seg = t.path.segments.first_mut().unwrap();
+            if seg.arguments.is_empty() && self.0.contains(&seg.ident) {
+                *t = parse_quote!(::wasm_bindgen::JsValue);
+            }
+        }
+        // Make sure we visit T in Option<T>
+        for seg in &mut t.path.segments {
+            self.visit_path_segment_mut(seg);
+        }
+    }
+}
+
+/// * Dedupe items with the same name
+/// * Replace Self with class name
+#[derive(Default)]
+pub struct ModuleBindingsCleaner(HashSet<String>);
+
+impl VisitMut for ModuleBindingsCleaner {
+    fn visit_signature_mut(&mut self, sig: &mut syn::Signature) {
+        let class_type = if let Some(FnArg::Typed(PatType { ty, .. })) = sig.inputs.first() {
+            if let Type::Reference(ty) = ty.as_ref() {
+                ty.elem.as_ref()
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
+
+        struct SelfToClass(Type);
+        impl VisitMut for SelfToClass {
+            fn visit_type_mut(&mut self, t: &mut Type) {
+                if let Type::Path(tp) = t {
+                    if tp.path.segments.len() == 1 {
+                        let seg = tp.path.segments.first_mut().unwrap();
+                        if seg.ident == "Self" && seg.arguments.is_empty() {
+                            *t = self.0.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut stc = SelfToClass(class_type.clone());
+        stc.visit_signature_mut(sig);
+    }
+
+    fn visit_foreign_item_mut(&mut self, fi: &mut ForeignItem) {
+        if let ForeignItem::Fn(func) = fi {
+            self.visit_foreign_item_fn_mut(func);
+        }
+
+        let (ident, attrs) = match fi {
+            ForeignItem::Fn(f) => (&mut f.sig.ident, &mut f.attrs),
+            ForeignItem::Static(s) => (&mut s.ident, &mut s.attrs),
+            ForeignItem::Type(_) | ForeignItem::Verbatim(_) | ForeignItem::Macro(_) => return,
+            other => todo!("{other:?}"),
+        };
+        let mut ident_string = ident.to_string();
+        let mut counter = 1;
+        while self.0.contains(&ident_string) {
+            ident_string = format!("{ident}_{counter}");
+            counter += 1;
+        }
+        if counter > 1 {
+            let has_rename = attrs.iter().any(|attr| {
+                if attr.path.get_ident() == Some(&parse_quote!(wasm_bindgen)) {
+                    if let Ok(parsed) = attr.parse_args::<ExprAssign>() {
+                        if parsed.left == parse_quote!(js_name) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+
+            if !has_rename {
+                attrs.push(parse_quote!(#[wasm_bindgen(js_name = #ident)]))
+            }
+            *ident = parse_str(&ident_string).unwrap();
+        }
+        self.0.insert(ident_string);
+    }
+}
+
 /// Collects all the names exported by a module
 #[derive(Default)]
 pub struct CollectPubs(pub HashSet<String>);
 
 impl<'ast> Visit<'ast> for CollectPubs {
-    fn visit_use_name(&mut self, un: &'ast syn::UseName) {
+    fn visit_use_name(&mut self, un: &'ast UseName) {
         self.0.insert(un.ident.to_string());
     }
 
-    fn visit_use_rename(&mut self, rn: &'ast syn::UseRename) {
+    fn visit_use_rename(&mut self, rn: &'ast UseRename) {
         self.0.insert(rn.rename.to_string());
     }
 
@@ -233,20 +338,89 @@ pub struct WasmAbify {
     pub wasm_abi_types: HashSet<Type>,
 }
 
-impl VisitMut for WasmAbify {
-    fn visit_type_mut(&mut self, t: &mut Type) {
+#[derive(Default, Debug)]
+struct NestedTyFinder<'ast> {
+    result: Option<&'ast Type>,
+}
+
+impl<'ast> Visit<'ast> for NestedTyFinder<'ast> {
+    fn visit_type(&mut self, t: &'ast Type) {
         if let Type::Path(tp) = t {
-            if tp.path.segments.len() == 1 {
-                let seg = tp.path.segments.first().unwrap();
-                if seg.arguments.is_empty() {
-                    let ident: String = seg.ident.to_string();
-                    if KNOWN_STRING_TYPES.contains(ident.as_str())
-                        || KNOWN_WEB_SYS_TYPES.contains(ident.as_str())
-                        || KNOWN_JS_SYS_TYPES.contains(ident.as_str())
+            if tp.path.segments.len() == 3 {
+                let seg = tp.path.segments.last().unwrap();
+                if seg.ident == "Option" {
+                    if let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                        args,
+                        ..
+                    }) = &seg.arguments
                     {
-                        return;
+                        if args.len() == 1 {
+                            if let GenericArgument::Type(t) = args.first().unwrap() {
+                                self.visit_type(t)
+                            }
+                        }
+                    }
+                } else if seg.ident == "Box" {
+                    if let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                        args,
+                        ..
+                    }) = &seg.arguments
+                    {
+                        if args.len() == 1 {
+                            if let GenericArgument::Type(Type::Slice(TypeSlice { elem, .. })) =
+                                args.first().unwrap()
+                            {
+                                self.visit_type(elem);
+                            }
+                        }
                     }
                 }
+            } else if tp.path.segments.len() == 1 {
+                let seg = tp.path.segments.first().unwrap();
+                if seg.arguments.is_empty() {
+                    self.result = Some(t);
+                }
+            }
+        } else {
+            self.result = Some(t);
+        }
+    }
+}
+
+impl VisitMut for WasmAbify {
+    fn visit_return_type_mut(&mut self, rt: &mut ReturnType) {
+        // Can't return references
+        if let ReturnType::Type(_, ty) = rt {
+            let mut tyf = NestedTyFinder::default();
+            tyf.visit_type(ty);
+            if let Some(Type::Reference(TypeReference { elem, .. })) = tyf.result {
+                if let Type::TraitObject(_) = elem.as_ref() {
+                    *ty = parse_quote!(::wasm_bindgen::JsValue);
+                    return;
+                }
+            }
+            self.visit_type_mut(ty);
+        }
+    }
+
+    fn visit_type_mut(&mut self, t: &mut Type) {
+        // if let Type::Path(_) = t {
+        //     let mut sf = NestedTyFinder::default();
+        //     sf.visit_type(t);
+        //     if let Some(Type::Path(nested_tp)) = sf.result {
+        //         let seg = nested_tp.path.segments.first().unwrap();
+        //         let ident: String = seg.ident.to_string();
+        //         if KNOWN_STRING_TYPES.contains(ident.as_str())
+        //             || KNOWN_WEB_SYS_TYPES.contains(ident.as_str())
+        //             || KNOWN_JS_SYS_TYPES.contains(ident.as_str())
+        //         {
+        //             return;
+        //         }
+        //     }
+        // }
+        if let Type::Reference(TypeReference { elem, .. }) = t {
+            if let Type::TraitObject(_) = elem.as_ref() {
+                return;
             }
         }
         if !self.wasm_abi_types.contains(t) {
@@ -254,8 +428,9 @@ impl VisitMut for WasmAbify {
         }
     }
 }
+
 lazy_static! {
-    static ref KNOWN_STRING_TYPES: HashSet<&'static str> = [
+    pub static ref KNOWN_STRING_TYPES: HashSet<&'static str> = [
         "AlignSetting",
         "AnimationPlayState",
         "AnimationReplaceState",
@@ -410,7 +585,7 @@ lazy_static! {
     ]
     .into_iter()
     .collect();
-    static ref KNOWN_WEB_SYS_TYPES: HashSet<&'static str> = [
+    pub static ref KNOWN_WEB_SYS_TYPES: HashSet<&'static str> = [
         "AbortController",
         "AbortSignal",
         "AddEventListenerOptions",
@@ -1704,7 +1879,7 @@ lazy_static! {
     ]
     .into_iter()
     .collect();
-    static ref KNOWN_JS_SYS_TYPES: HashSet<&'static str> = [
+    pub static ref KNOWN_JS_SYS_TYPES: HashSet<&'static str> = [
         "Array",
         "ArrayBuffer",
         "ArrayIter",

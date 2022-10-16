@@ -30,6 +30,7 @@ pub fn pat_to_pat_type(pat: &Pat) -> PatType {
                 ty: Box::new(ty),
             }
         }
+        // TODO: wasm bindgen variadic
         Pat::Rest(RestPat { arg, .. }) => pat_to_pat_type(arg),
         Pat::Array(_) | Pat::Object(_) | Pat::Assign(_) | Pat::Invalid(_) | Pat::Expr(_) => {
             todo!("{pat:?}")

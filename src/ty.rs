@@ -1,12 +1,22 @@
 use std::collections::HashSet;
 
 use swc_ecma_ast::{
-    Ident, Str, TsEntityName, TsFnOrConstructorType, TsImportType, TsKeywordTypeKind, TsType,
-    TsTypeRef, TsUnionOrIntersectionType,
+    ArrayPat, BindingIdent, Ident, ObjectPat, Pat, RestPat, Str, TsEntityName,
+    TsFnOrConstructorType, TsFnParam, TsFnType, TsImportType, TsIntersectionType,
+    TsKeywordTypeKind, TsTupleElement, TsTupleType, TsType, TsTypeRef, TsUnionOrIntersectionType,
 };
-use syn::{parse_quote, parse_str, punctuated::Punctuated, token::Comma, GenericArgument, Type};
+use syn::{
+    parse_quote, parse_str,
+    punctuated::Punctuated,
+    token::{Colon2, Comma},
+    visit_mut::VisitMut,
+    GenericArgument, Path, PathArguments, PathSegment, Type, TypePath,
+};
 
-use crate::util::{import_path_to_type_path_prefix, sanitize_sym};
+use crate::util::{
+    import_path_to_type_path_prefix, sanitize_sym, ByeByeGenerics, KNOWN_JS_SYS_TYPES,
+    KNOWN_STRING_TYPES, KNOWN_WEB_SYS_TYPES,
+};
 pub fn ts_type_to_type(ty: &TsType) -> Type {
     match ty {
         TsType::TsKeywordType(kt) => match kt.kind {
@@ -26,7 +36,32 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
             | TsKeywordTypeKind::TsIntrinsicKeyword => todo!("{kt:?}"),
         },
         TsType::TsFnOrConstructorType(fnorc) => match fnorc {
-            TsFnOrConstructorType::TsFnType(_) => parse_quote!(::wasm_bindgen::JsValue),
+            TsFnOrConstructorType::TsFnType(TsFnType {
+                params,
+                type_params,
+                // TODO: insert this return type on the signature
+                type_ann,
+                ..
+            }) => {
+                let mut gen = ByeByeGenerics::new(type_params.iter());
+                let mut inputs: Punctuated<Type, Comma> = Punctuated::new();
+                for p in params {
+                    let ty = match p {
+                        TsFnParam::Ident(BindingIdent { type_ann, .. })
+                        // TODO: how to mark this as variadic :(
+                        | TsFnParam::Rest(RestPat { type_ann, .. })
+                        | TsFnParam::Array(ArrayPat { type_ann, .. })
+                        | TsFnParam::Object(ObjectPat { type_ann , ..} )=> {
+                            type_ann.as_ref().map(|ann| ts_type_to_type(&ann.type_ann))
+                        }
+                    };
+                    inputs.push(ty.unwrap_or_else(|| parse_quote!(::wasm_bindgen::JsValue)));
+                }
+                inputs.iter_mut().for_each(|i| gen.visit_type_mut(i));
+                parse_quote! {
+                    &(dyn Fn(#inputs))
+                }
+            }
             TsFnOrConstructorType::TsConstructorType(ct) => todo!("{ct:?}"),
         },
         TsType::TsTypeRef(TsTypeRef {
@@ -34,7 +69,40 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
             type_params,
             ..
         }) => match type_name {
-            TsEntityName::TsQualifiedName(qn) => todo!("{qn:?}"),
+            qn @ TsEntityName::TsQualifiedName(_) => {
+                let mut type_path: Punctuated<PathSegment, Colon2> = Punctuated::new();
+
+                let mut syms = vec![];
+                let mut qn = qn;
+                while let TsEntityName::TsQualifiedName(quali) = qn {
+                    syms.push(&quali.right.sym);
+                    qn = &quali.left;
+                }
+                if let TsEntityName::Ident(ident) = qn {
+                    syms.push(&ident.sym);
+                }
+
+                for sym in syms[1..].iter().rev() {
+                    let revised_raw_name = format!("{}Mod", sym);
+                    type_path.push(PathSegment {
+                        ident: sanitize_sym(&revised_raw_name),
+                        arguments: PathArguments::None,
+                    });
+                }
+                type_path.push(PathSegment {
+                    ident: sanitize_sym(&syms.first().unwrap()),
+                    arguments: PathArguments::None,
+                });
+
+                TypePath {
+                    qself: None,
+                    path: Path {
+                        leading_colon: None,
+                        segments: type_path,
+                    },
+                }
+                .into()
+            }
             TsEntityName::Ident(Ident { sym, .. }) => {
                 let ident = sanitize_sym(sym.as_ref());
                 if let Some(type_params) = type_params {
@@ -62,7 +130,7 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
         }
         TsType::TsArrayType(at) => {
             let elem_ty = ts_type_to_type(&at.elem_type);
-            parse_quote!(Box<[#elem_ty]>)
+            parse_quote!(::std::boxed::Box<[#elem_ty]>)
         }
         TsType::TsOptionalType(ot) => {
             let opt_ty = ts_type_to_type(&ot.type_ann);
@@ -83,7 +151,12 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
                     parse_quote!(::wasm_bindgen::JsValue)
                 }
             }
-            TsUnionOrIntersectionType::TsIntersectionType(it) => todo!("{it:?}"),
+            TsUnionOrIntersectionType::TsIntersectionType(TsIntersectionType { types, .. }) => {
+                for ty in types {
+                    return ts_type_to_type(ty);
+                }
+                parse_quote!(::wasm_bindgen::JsValue)
+            }
         },
         TsType::TsParenthesizedType(pt) => {
             let pty = ts_type_to_type(&pt.type_ann);
@@ -108,30 +181,45 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
                 }
             }
         }
-        TsType::TsTupleType(_)
-        | TsType::TsRestType(_)
+        TsType::TsTupleType(TsTupleType { elem_types, .. }) => {
+            let mut types: Punctuated<Type, Comma> = Punctuated::new();
+            for TsTupleElement { ty, .. } in elem_types {
+                types.push(ts_type_to_type(ty));
+            }
+            parse_quote!((#types))
+        }
+        TsType::TsIndexedAccessType(_) => {
+            parse_quote!(::wasm_bindgen::JsValue)
+        }
+        TsType::TsInferType(_) => {
+            parse_quote!(::wasm_bindgen::JsValue)
+        }
+        TsType::TsThisType(_) => {
+            parse_quote!(Self)
+        }
+        TsType::TsRestType(_)
         | TsType::TsTypePredicate(_)
         | TsType::TsConditionalType(_)
-        | TsType::TsInferType(_)
         | TsType::TsTypeOperator(_)
-        | TsType::TsIndexedAccessType(_)
-        | TsType::TsMappedType(_)
-        | TsType::TsThisType(_) => todo!("{ty:?}"),
+        | TsType::TsMappedType(_) => todo!("{ty:?}"),
     }
 }
 
 pub fn wasm_abi_set(custom: &HashSet<String>) -> HashSet<Type> {
     thread_local! {
         static SLICEABLE_BUILTINS: [Type; 8] = [
-            parse_quote!(i32), parse_quote!(isize), parse_quote!(i64),
-            parse_quote!(u32), parse_quote!(usize), parse_quote!(u64),
-            parse_quote!(f32), parse_quote!(f64),
+            parse_quote!(::core::primitive::i32), parse_quote!(::core::primitive::isize), parse_quote!(::core::primitive::i64),
+            parse_quote!(::core::primitive::u32), parse_quote!(::core::primitive::usize), parse_quote!(::core::primitive::u64),
+            parse_quote!(::core::primitive::f32), parse_quote!(::core::primitive::f64),
         ];
         static NON_SLICEABLE_BUILTINS: [Type; 4] = [
-            parse_quote!(bool), parse_quote!(char),
+            parse_quote!(::core::primitive::bool), parse_quote!(::core::primitive::char),
             parse_quote!(()),
             parse_quote!(::std::string::String),
         ];
+        static KNOWN_TYPES: HashSet<Type> = KNOWN_STRING_TYPES.iter().chain(KNOWN_WEB_SYS_TYPES.iter()).chain(KNOWN_JS_SYS_TYPES.iter()).map(|s| {
+            parse_str(s).unwrap()
+        }).collect();
     }
 
     SLICEABLE_BUILTINS.with(|builtins| {
@@ -140,28 +228,34 @@ pub fn wasm_abi_set(custom: &HashSet<String>) -> HashSet<Type> {
             .iter()
             .cloned()
             .chain(NON_SLICEABLE_BUILTINS.with(|b| b.clone()))
+            .chain(KNOWN_TYPES.with(|t| t.clone()))
             .chain(js_objects.clone())
             .map::<Type, _>(|t| parse_quote!(&#t));
         let opts = builtins
             .iter()
             .cloned()
             .chain(NON_SLICEABLE_BUILTINS.with(|b| b.clone()))
+            .chain(KNOWN_TYPES.with(|t| t.clone()))
             .chain(js_objects.clone())
             .map::<Type, _>(|t| parse_quote!(::std::option::Option<#t>));
         let boxed_slices = builtins
             .iter()
             .cloned()
+            .chain(KNOWN_TYPES.with(|t| t.clone()))
             .chain(js_objects.clone())
             .map::<Type, _>(|t| parse_quote!(::std::boxed::Box<[#t]>));
         let opt_boxed_slices = builtins
             .iter()
             .cloned()
+            .chain(KNOWN_TYPES.with(|t| t.clone()))
             .chain(js_objects.clone())
             .map::<Type, _>(|t| parse_quote!(::std::option::Option<::std::boxed::Box<[#t]>>));
 
         builtins
             .iter()
             .cloned()
+            .chain(NON_SLICEABLE_BUILTINS.with(|b| b.clone()))
+            .chain(KNOWN_TYPES.with(|t| t.clone()))
             .chain(js_objects.clone())
             .chain(refs)
             .chain(opts)
@@ -170,4 +264,13 @@ pub fn wasm_abi_set(custom: &HashSet<String>) -> HashSet<Type> {
             .chain(std::iter::once(parse_quote!(::wasm_bindgen::JsValue)))
             .collect()
     })
+}
+
+pub fn fn_param_to_pat(param: TsFnParam) -> Pat {
+    match param {
+        TsFnParam::Ident(i) => Pat::Ident(i),
+        TsFnParam::Array(a) => Pat::Array(a),
+        TsFnParam::Rest(r) => Pat::Rest(r),
+        TsFnParam::Object(o) => Pat::Object(o),
+    }
 }

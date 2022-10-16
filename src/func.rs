@@ -7,7 +7,7 @@ use syn::{
 use crate::{
     pat::pat_to_pat_type,
     ty::ts_type_to_type,
-    util::{sanitize_sym, BindingsCleaner},
+    util::{sanitize_sym, ByeByeGenerics},
 };
 
 pub fn function_signature(name: &Ident, function: &Function) -> Signature {
@@ -18,7 +18,7 @@ pub fn function_signature(name: &Ident, function: &Function) -> Signature {
         .flat_map(|tp| tp.params.iter())
         .map(|t| sanitize_sym(&t.name.sym))
         .collect();
-    let mut generic_stripper = BindingsCleaner(generics);
+    let mut generic_stripper = ByeByeGenerics(generics);
 
     let mut params: Punctuated<FnArg, Comma> = Punctuated::new();
     for param in function.params.iter() {
@@ -46,4 +46,3 @@ pub fn function_signature(name: &Ident, function: &Function) -> Signature {
     generic_stripper.visit_signature_mut(&mut sig);
     sig
 }
-
