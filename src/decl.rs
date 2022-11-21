@@ -130,7 +130,7 @@ pub fn ts_module_to_binding(module: &TsModuleDecl) -> Option<Item> {
 
     let items = match module.body.as_ref() {
         Some(TsNamespaceBody::TsModuleBlock(TsModuleBlock { body, .. })) => {
-            module_as_binding(body, Some(&raw_name))
+            module_as_binding(body, Some(raw_name))
         }
         Some(TsNamespaceBody::TsNamespaceDecl(_)) => {
             eprintln!("TS namespaces unsupported: {name}");
@@ -248,17 +248,14 @@ fn class_to_binding(
                 ..
             }) => {
                 if let Some(Ident { sym, .. }) = key.as_ident() {
-                    items.push(
-                        prop_to_binding(
-                            &class_name,
-                            &mut cleaner,
-                            sym,
-                            *is_static,
-                            *is_optional,
-                            type_ann.as_ref(),
-                        )
-                        .into(),
-                    );
+                    items.push(prop_to_binding(
+                        &class_name,
+                        &mut cleaner,
+                        sym,
+                        *is_static,
+                        *is_optional,
+                        type_ann.as_ref().map(|b| b.as_ref()),
+                    ));
                 }
             }
         }
@@ -287,14 +284,14 @@ fn ty_elems_to_binding<'a>(
             }) => {
                 assert!(params.is_empty());
                 if let Some(Ident { sym, .. }) = key.as_ident() {
-                    let mut cleaner = ByeByeGenerics::new(type_params.iter()).join(&class_cleaner);
+                    let mut cleaner = ByeByeGenerics::new(type_params.iter()).join(class_cleaner);
                     items.push(prop_to_binding(
-                        &name,
+                        name,
                         &mut cleaner,
                         sym,
                         false,
                         *optional,
-                        type_ann.as_ref(),
+                        type_ann.as_ref().map(|b| b.as_ref()),
                     ));
                 }
             }
@@ -307,7 +304,7 @@ fn ty_elems_to_binding<'a>(
                 let fake_func = Function {
                     params: vec![],
                     decorators: vec![],
-                    span: span.clone(),
+                    span: *span,
                     body: None,
                     is_generator: false,
                     is_async: false,
@@ -317,7 +314,7 @@ fn ty_elems_to_binding<'a>(
                 if let Some(Ident { sym, .. }) = key.as_ident() {
                     items.push(
                         method_to_binding(
-                            &name,
+                            name,
                             class_cleaner,
                             sym,
                             MethodKind::Getter,
@@ -336,13 +333,13 @@ fn ty_elems_to_binding<'a>(
                         .cloned()
                         .map(fn_param_to_pat)
                         .map(|pat| Param {
-                            span: span.clone(),
+                            span: *span,
                             decorators: vec![],
                             pat,
                         })
                         .collect(),
                     decorators: vec![],
-                    span: span.clone(),
+                    span: *span,
                     body: None,
                     is_generator: false,
                     is_async: false,
@@ -352,7 +349,7 @@ fn ty_elems_to_binding<'a>(
                 if let Some(Ident { sym, .. }) = key.as_ident() {
                     items.push(
                         method_to_binding(
-                            &name,
+                            name,
                             class_cleaner,
                             sym,
                             MethodKind::Setter,
@@ -377,24 +374,24 @@ fn ty_elems_to_binding<'a>(
                         .cloned()
                         .map(fn_param_to_pat)
                         .map(|pat| Param {
-                            span: span.clone(),
+                            span: *span,
                             decorators: vec![],
                             pat,
                         })
                         .collect(),
                     decorators: vec![],
-                    span: span.clone(),
+                    span: *span,
                     body: None,
                     is_generator: false,
                     is_async: false,
                     type_params: type_params.clone(),
                     return_type: type_ann.clone(),
                 };
-                let mut cleaner = ByeByeGenerics::new(type_params.iter()).join(&class_cleaner);
+                let mut cleaner = ByeByeGenerics::new(type_params.iter()).join(class_cleaner);
                 if let Some(Ident { sym, .. }) = key.as_ident() {
                     items.push(
                         method_to_binding(
-                            &name,
+                            name,
                             &mut cleaner,
                             sym,
                             MethodKind::Method,
@@ -485,7 +482,7 @@ fn prop_to_binding(
     raw_prop_name: &str,
     is_static: bool,
     is_optional: bool,
-    type_ann: Option<&Box<TsTypeAnn>>,
+    type_ann: Option<&TsTypeAnn>,
 ) -> ForeignItem {
     let prop_name = sanitize_sym(raw_prop_name);
     let mut ty = if let Some(ann) = type_ann {

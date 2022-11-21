@@ -149,7 +149,7 @@ fn main() -> std::io::Result<()> {
         let mut f = if named_parent_exists {
             OpenOptions::new().append(true).open(&named_parent)?
         } else {
-            File::create(&path)?
+            File::create(path)?
         };
 
         for m in mods {
@@ -157,10 +157,10 @@ fn main() -> std::io::Result<()> {
                 let name_rs_exists = path
                     .parent()
                     .unwrap()
-                    .join(&m)
+                    .join(m)
                     .with_extension("rs")
                     .exists();
-                let mod_rs_exists = path.parent().unwrap().join(&m).join("mod.rs").exists();
+                let mod_rs_exists = path.parent().unwrap().join(m).join("mod.rs").exists();
                 if name_rs_exists {
                     writeln!(
                         f,
@@ -190,10 +190,10 @@ fn main() -> std::io::Result<()> {
                 let name_rs_exists = path
                     .parent()
                     .unwrap()
-                    .join(&m)
+                    .join(m)
                     .with_extension("rs")
                     .exists();
-                let mod_rs_exists = path.parent().unwrap().join(&m).join("mod.rs").exists();
+                let mod_rs_exists = path.parent().unwrap().join(m).join("mod.rs").exists();
                 if name_rs_exists {
                     writeln!(f, "#[path = \"{m}.rs\"]")?;
                 } else if mod_rs_exists {

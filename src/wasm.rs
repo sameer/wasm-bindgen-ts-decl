@@ -3,9 +3,11 @@
 use std::cmp::Ordering;
 
 use syn::{
-    parse_quote, punctuated::Punctuated, token::{Comma, Pound, Bang, Bracket}, Attribute, Expr, ExprAssign, ExprPath,
-    FnArg, ForeignItem, ForeignItemFn, Ident, Pat, PatType, Path, ReturnType, Type, TypePath,
-    TypeReference, Token, AttrStyle, __private::ToTokens,
+    parse_quote,
+    punctuated::Punctuated,
+    token::{Bang, Bracket, Comma, Pound},
+    AttrStyle, Attribute, Expr, ExprAssign, ExprPath, FnArg, ForeignItem, ForeignItemFn, Ident,
+    Pat, PatType, Path, ReturnType, Type, TypePath, TypeReference,
 };
 
 pub fn merge_attrs(fi: &mut ForeignItem) {
@@ -45,7 +47,7 @@ pub fn merge_attrs(fi: &mut ForeignItem) {
             tokens: parse_quote!(),
         });
     }
-    *fi = parse_quote!{
+    *fi = parse_quote! {
         #[wasm_bindgen(#wasm_attrs)]
         #fi
     }

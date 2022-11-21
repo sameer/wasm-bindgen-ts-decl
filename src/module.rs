@@ -182,7 +182,7 @@ pub fn module_as_binding(body: &[ModuleItem], namespace: Option<&str>) -> Vec<It
                 ..
             }))
             | ModuleItem::Stmt(Stmt::Decl(Decl::TsModule(tsm))) => {
-                let mod_extern = ts_module_to_binding(&tsm);
+                let mod_extern = ts_module_to_binding(tsm);
                 items.extend(mod_extern.into_iter());
             }
             ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl { decl, .. }))

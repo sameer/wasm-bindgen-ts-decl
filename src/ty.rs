@@ -93,7 +93,7 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
                     });
                 }
                 type_path.push(PathSegment {
-                    ident: sanitize_sym(&syms.first().unwrap()),
+                    ident: sanitize_sym(syms.first().unwrap()),
                     arguments: PathArguments::None,
                 });
 
@@ -161,7 +161,7 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
                 }
             }
             TsUnionOrIntersectionType::TsIntersectionType(TsIntersectionType { types, .. }) => {
-                for ty in types {
+                if let Some(ty) = types.first() {
                     return ts_type_to_type(ty);
                 }
                 eprintln!("Empty intersection type");

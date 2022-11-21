@@ -4,9 +4,9 @@ use lazy_static::lazy_static;
 use swc_ecma_ast::TsTypeParamDecl;
 use syn::{
     parse_quote, parse_str, punctuated::Punctuated, token::Colon2, visit::Visit,
-    visit_mut::VisitMut, AngleBracketedGenericArguments, Attribute, Expr, ExprAssign, ExprPath,
-    FnArg, ForeignItem, GenericArgument, Ident, ItemUse, PatType, PathArguments, PathSegment,
-    ReturnType, Token, Type, TypePath, TypeReference, TypeSlice, UseName, UseRename,
+    visit_mut::VisitMut, AngleBracketedGenericArguments, Attribute, ExprPath, FnArg, ForeignItem,
+    GenericArgument, Ident, ItemUse, PatType, PathArguments, PathSegment, ReturnType, Token, Type,
+    TypePath, TypeReference, TypeSlice, UseName, UseRename, __private::ToTokens,
 };
 
 use crate::wasm::{extends, js_value, merge_attrs, method_of};
@@ -100,7 +100,7 @@ impl VisitMut for BindingsCleaner {
             ForeignItem::Static(s) => self.visit_foreign_item_static_mut(s),
             ForeignItem::Type(t) => self.visit_foreign_item_type_mut(t),
             ForeignItem::Macro(m) => self.visit_foreign_item_macro_mut(m),
-            ForeignItem::Verbatim(_) | _ => {}
+            _ => {}
         }
     }
 
@@ -326,10 +326,7 @@ impl<'ast> Visit<'ast> for SysUseAdder {
 
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
         if let Some(ExprPath { path, .. }) = extends(attr) {
-            self.visit_type_path(&TypePath {
-                qself: None,
-                path: path.clone(),
-            });
+            self.visit_type_path(&TypePath { qself: None, path });
         }
     }
 }
@@ -412,6 +409,7 @@ impl VisitMut for WasmAbify {
             }
         }
         if !self.wasm_abi_types.contains(t) {
+            eprintln!("Missing {}", t.into_token_stream());
             *t = js_value().into();
         }
     }
