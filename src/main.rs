@@ -24,6 +24,7 @@ mod module;
 mod pat;
 mod ty;
 mod util;
+mod wasm;
 
 fn main() -> std::io::Result<()> {
     let typescript_path = PathBuf::from(args().nth(1).expect("No dir specified"));

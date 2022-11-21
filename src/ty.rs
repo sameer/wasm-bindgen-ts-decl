@@ -13,9 +13,12 @@ use syn::{
     GenericArgument, Path, PathArguments, PathSegment, Type, TypePath,
 };
 
-use crate::util::{
-    import_path_to_type_path_prefix, sanitize_sym, ByeByeGenerics, KNOWN_JS_SYS_TYPES,
-    KNOWN_STRING_TYPES, KNOWN_WEB_SYS_TYPES,
+use crate::{
+    util::{
+        import_path_to_type_path_prefix, sanitize_sym, ByeByeGenerics, KNOWN_JS_SYS_TYPES,
+        KNOWN_STRING_TYPES, KNOWN_WEB_SYS_TYPES,
+    },
+    wasm::js_value,
 };
 pub fn ts_type_to_type(ty: &TsType) -> Type {
     match ty {
@@ -24,14 +27,14 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
             | TsKeywordTypeKind::TsAnyKeyword
             | TsKeywordTypeKind::TsNullKeyword
             | TsKeywordTypeKind::TsUndefinedKeyword
-            | TsKeywordTypeKind::TsNeverKeyword => parse_quote!(::wasm_bindgen::JsValue),
+            | TsKeywordTypeKind::TsNeverKeyword
+            | TsKeywordTypeKind::TsObjectKeyword => js_value().into(),
             TsKeywordTypeKind::TsNumberKeyword => parse_quote!(::core::primitive::f64),
             TsKeywordTypeKind::TsBooleanKeyword => parse_quote!(::core::primitive::bool),
             TsKeywordTypeKind::TsStringKeyword => parse_quote!(::std::string::String),
 
             TsKeywordTypeKind::TsVoidKeyword => parse_quote!(()),
-            TsKeywordTypeKind::TsObjectKeyword
-            | TsKeywordTypeKind::TsBigIntKeyword
+            TsKeywordTypeKind::TsBigIntKeyword
             | TsKeywordTypeKind::TsSymbolKeyword
             | TsKeywordTypeKind::TsIntrinsicKeyword => todo!("{kt:?}"),
         },
@@ -55,7 +58,7 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
                             type_ann.as_ref().map(|ann| ts_type_to_type(&ann.type_ann))
                         }
                     };
-                    inputs.push(ty.unwrap_or_else(|| parse_quote!(::wasm_bindgen::JsValue)));
+                    inputs.push(ty.unwrap_or_else(|| js_value().into()));
                 }
                 inputs.iter_mut().for_each(|i| gen.visit_type_mut(i));
                 parse_quote! {
@@ -120,13 +123,13 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
                 }
             }
         },
-        TsType::TsTypeQuery(_) => {
+        TsType::TsTypeQuery(tq) => {
             eprintln!("Type queries unsupported");
-            parse_quote!(::wasm_bindgen::JsValue)
+            js_value().into()
         }
-        TsType::TsTypeLit(_) => {
+        TsType::TsTypeLit(tl) => {
             eprintln!("Type literals unsupported");
-            parse_quote!(::wasm_bindgen::JsValue)
+            js_value().into()
         }
         TsType::TsArrayType(at) => {
             let elem_ty = ts_type_to_type(&at.elem_type);
@@ -142,28 +145,36 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
                     && union.types[1]
                         .as_ref()
                         .as_ts_keyword_type()
-                        .map(|k| k.kind == TsKeywordTypeKind::TsUndefinedKeyword)
+                        .map(|k| {
+                            matches!(
+                                k.kind,
+                                TsKeywordTypeKind::TsUndefinedKeyword
+                                    | TsKeywordTypeKind::TsNullKeyword
+                            )
+                        })
                         .unwrap_or(false)
                 {
                     let opt_ty = ts_type_to_type(&union.types[0]);
                     parse_quote!(::std::option::Option<#opt_ty>)
                 } else {
-                    parse_quote!(::wasm_bindgen::JsValue)
+                    js_value().into()
                 }
             }
             TsUnionOrIntersectionType::TsIntersectionType(TsIntersectionType { types, .. }) => {
                 for ty in types {
                     return ts_type_to_type(ty);
                 }
-                parse_quote!(::wasm_bindgen::JsValue)
+                eprintln!("Empty intersection type");
+                js_value().into()
             }
         },
         TsType::TsParenthesizedType(pt) => {
             let pty = ts_type_to_type(&pt.type_ann);
             parse_quote!((#pty))
         }
-        TsType::TsLitType(_) => {
-            parse_quote!(::wasm_bindgen::JsValue)
+        TsType::TsLitType(_tlt) => {
+            eprintln!("Lit types unsupported");
+            js_value().into()
         }
 
         TsType::TsImportType(TsImportType {
@@ -172,7 +183,8 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
             ..
         }) => {
             if !value.starts_with('.') {
-                parse_quote!(::wasm_bindgen::JsValue)
+                eprintln!("Import unknown");
+                js_value().into()
             } else {
                 let path = import_path_to_type_path_prefix(value);
                 let ident = sanitize_sym(&qualifier.as_ref().unwrap().as_ident().unwrap().sym);
@@ -188,12 +200,11 @@ pub fn ts_type_to_type(ty: &TsType) -> Type {
             }
             parse_quote!((#types))
         }
-        TsType::TsIndexedAccessType(_) => {
-            parse_quote!(::wasm_bindgen::JsValue)
+        TsType::TsIndexedAccessType(_iat) => {
+            eprintln!("Indexed access type unsupported");
+            js_value().into()
         }
-        TsType::TsInferType(_) => {
-            parse_quote!(::wasm_bindgen::JsValue)
-        }
+        TsType::TsInferType(_) => js_value().into(),
         TsType::TsThisType(_) => {
             parse_quote!(Self)
         }
@@ -261,7 +272,7 @@ pub fn wasm_abi_set(custom: &HashSet<String>) -> HashSet<Type> {
             .chain(opts)
             .chain(boxed_slices)
             .chain(opt_boxed_slices)
-            .chain(std::iter::once(parse_quote!(::wasm_bindgen::JsValue)))
+            .chain(std::iter::once(js_value().into()))
             .collect()
     })
 }

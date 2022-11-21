@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use lazy_static::lazy_static;
 use swc_ecma_ast::TsTypeParamDecl;
@@ -8,6 +8,8 @@ use syn::{
     FnArg, ForeignItem, GenericArgument, Ident, ItemUse, PatType, PathArguments, PathSegment,
     ReturnType, Token, Type, TypePath, TypeReference, TypeSlice, UseName, UseRename,
 };
+
+use crate::wasm::{extends, js_value, merge_attrs, method_of};
 
 /// Makes a JS ident a valid Rust ident.
 /// Also changes casing to match [web_sys] & [js_sys].
@@ -91,6 +93,17 @@ pub fn import_path_to_type_path_prefix(path: &str) -> Punctuated<PathSegment, Co
 pub struct BindingsCleaner;
 
 impl VisitMut for BindingsCleaner {
+    fn visit_foreign_item_mut(&mut self, fi: &mut ForeignItem) {
+        merge_attrs(fi);
+        match fi {
+            ForeignItem::Fn(f) => self.visit_foreign_item_fn_mut(f),
+            ForeignItem::Static(s) => self.visit_foreign_item_static_mut(s),
+            ForeignItem::Type(t) => self.visit_foreign_item_type_mut(t),
+            ForeignItem::Macro(m) => self.visit_foreign_item_macro_mut(m),
+            ForeignItem::Verbatim(_) | _ => {}
+        }
+    }
+
     fn visit_type_mut(&mut self, t: &mut Type) {
         match t {
             Type::Array(t) => self.visit_type_array_mut(t),
@@ -175,7 +188,7 @@ impl VisitMut for ByeByeGenerics {
         if t.path.segments.len() == 1 {
             let seg = t.path.segments.first_mut().unwrap();
             if seg.arguments.is_empty() && self.0.contains(&seg.ident) {
-                *t = parse_quote!(::wasm_bindgen::JsValue);
+                *t = js_value();
             }
         }
         // Make sure we visit T in Option<T>
@@ -188,7 +201,7 @@ impl VisitMut for ByeByeGenerics {
 /// * Dedupe items with the same name
 /// * Replace Self with class name
 #[derive(Default)]
-pub struct ModuleBindingsCleaner(HashSet<String>);
+pub struct ModuleBindingsCleaner(HashMap<Option<syn::Path>, HashSet<String>>);
 
 impl VisitMut for ModuleBindingsCleaner {
     fn visit_signature_mut(&mut self, sig: &mut syn::Signature) {
@@ -225,6 +238,12 @@ impl VisitMut for ModuleBindingsCleaner {
             self.visit_foreign_item_fn_mut(func);
         }
 
+        let clazz = if let ForeignItem::Fn(ff) = fi {
+            method_of(ff)
+        } else {
+            None
+        };
+
         let (ident, attrs) = match fi {
             ForeignItem::Fn(f) => (&mut f.sig.ident, &mut f.attrs),
             ForeignItem::Static(s) => (&mut s.ident, &mut s.attrs),
@@ -233,28 +252,16 @@ impl VisitMut for ModuleBindingsCleaner {
         };
         let mut ident_string = ident.to_string();
         let mut counter = 1;
-        while self.0.contains(&ident_string) {
+
+        let entries = self.0.entry(clazz).or_default();
+        while entries.contains(&ident_string) {
             ident_string = format!("{ident}_{counter}");
             counter += 1;
         }
         if counter > 1 {
-            let has_rename = attrs.iter().any(|attr| {
-                if attr.path.get_ident() == Some(&parse_quote!(wasm_bindgen)) {
-                    if let Ok(parsed) = attr.parse_args::<ExprAssign>() {
-                        if parsed.left == parse_quote!(js_name) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            });
-
-            if !has_rename {
-                attrs.push(parse_quote!(#[wasm_bindgen(js_name = #ident)]))
-            }
             *ident = parse_str(&ident_string).unwrap();
         }
-        self.0.insert(ident_string);
+        entries.insert(ident_string);
     }
 }
 
@@ -303,11 +310,11 @@ impl<'ast> Visit<'ast> for SysUseAdder {
             if !self.pubs.contains(&seg_ident_string) {
                 if KNOWN_WEB_SYS_TYPES.contains(&seg_ident_string.as_str()) {
                     self.uses.insert(parse_quote! {
-                        use web_sys:: #seg_ident;
+                        use ::web_sys:: #seg_ident;
                     });
                 } else if KNOWN_JS_SYS_TYPES.contains(&seg_ident_string.as_str()) {
                     self.uses.insert(parse_quote! {
-                        use js_sys:: #seg_ident;
+                        use ::js_sys:: #seg_ident;
                     });
                 }
             }
@@ -318,17 +325,11 @@ impl<'ast> Visit<'ast> for SysUseAdder {
     }
 
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
-        if attr.path.get_ident() == Some(&parse_quote!(wasm_bindgen)) {
-            if let Ok(parsed) = attr.parse_args::<ExprAssign>() {
-                if parsed.left == parse_quote!(extends) {
-                    if let Expr::Path(ExprPath { path, .. }) = parsed.right.as_ref() {
-                        self.visit_type_path(&TypePath {
-                            qself: None,
-                            path: path.clone(),
-                        });
-                    }
-                }
-            }
+        if let Some(ExprPath { path, .. }) = extends(attr) {
+            self.visit_type_path(&TypePath {
+                qself: None,
+                path: path.clone(),
+            });
         }
     }
 }
@@ -395,7 +396,7 @@ impl VisitMut for WasmAbify {
             tyf.visit_type(ty);
             if let Some(Type::Reference(TypeReference { elem, .. })) = tyf.result {
                 if let Type::TraitObject(_) = elem.as_ref() {
-                    *ty = parse_quote!(::wasm_bindgen::JsValue);
+                    *ty = Box::new(js_value().into());
                     return;
                 }
             }
@@ -404,27 +405,14 @@ impl VisitMut for WasmAbify {
     }
 
     fn visit_type_mut(&mut self, t: &mut Type) {
-        // if let Type::Path(_) = t {
-        //     let mut sf = NestedTyFinder::default();
-        //     sf.visit_type(t);
-        //     if let Some(Type::Path(nested_tp)) = sf.result {
-        //         let seg = nested_tp.path.segments.first().unwrap();
-        //         let ident: String = seg.ident.to_string();
-        //         if KNOWN_STRING_TYPES.contains(ident.as_str())
-        //             || KNOWN_WEB_SYS_TYPES.contains(ident.as_str())
-        //             || KNOWN_JS_SYS_TYPES.contains(ident.as_str())
-        //         {
-        //             return;
-        //         }
-        //     }
-        // }
+        // Allow dyn Fns
         if let Type::Reference(TypeReference { elem, .. }) = t {
             if let Type::TraitObject(_) = elem.as_ref() {
                 return;
             }
         }
         if !self.wasm_abi_types.contains(t) {
-            *t = parse_quote!(::wasm_bindgen::JsValue);
+            *t = js_value().into();
         }
     }
 }

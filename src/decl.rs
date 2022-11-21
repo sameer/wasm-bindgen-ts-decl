@@ -10,8 +10,8 @@ use syn::{
     punctuated::Punctuated,
     token::{Brace, Comma},
     visit_mut::VisitMut,
-    FnArg, ForeignItem, ForeignItemFn, ForeignItemType, Item, ItemMod, PatType, Signature, Token,
-    VisPublic, Visibility, Pat,
+    FnArg, ForeignItem, ForeignItemFn, ForeignItemType, Item, ItemMod, Pat, PatType, Signature,
+    Token, VisPublic, Visibility,
 };
 
 use crate::{
@@ -20,6 +20,7 @@ use crate::{
     pat::pat_to_pat_type,
     ty::{fn_param_to_pat, ts_type_to_type},
     util::{sanitize_sym, ByeByeGenerics, ModuleBindingsCleaner},
+    wasm::js_value,
 };
 
 /// Get the raw identifier for a declaration if any
@@ -490,7 +491,7 @@ fn prop_to_binding(
     let mut ty = if let Some(ann) = type_ann {
         ts_type_to_type(&ann.type_ann)
     } else {
-        parse_quote!(::wasm_bindgen::JsValue)
+        js_value().into()
     };
     if is_optional {
         ty = parse_quote!(::std::option::Option<#ty>);

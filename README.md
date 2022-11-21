@@ -12,6 +12,8 @@ cargo run --release ./node_modules/@types/geojson/ dist
 
 ## TODOs
 
+- [ ] OR types
+- [ ] AND types
 - [ ] Variadic function support
 - [ ] Some TS features
 - [ ] Proper namespace/modules support

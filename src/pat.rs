@@ -1,7 +1,7 @@
 use swc_ecma_ast::{BindingIdent, Ident, Pat, RestPat};
 use syn::{parse_quote, PatType, Token};
 
-use crate::{ty::ts_type_to_type, util::sanitize_sym};
+use crate::{ty::ts_type_to_type, util::sanitize_sym, wasm::js_value};
 
 pub fn pat_to_pat_type(pat: &Pat) -> PatType {
     match pat {
@@ -16,7 +16,7 @@ pub fn pat_to_pat_type(pat: &Pat) -> PatType {
             let mut ty = if let Some(ann) = type_ann {
                 ts_type_to_type(&ann.type_ann)
             } else {
-                parse_quote!(::wasm_bindgen::JsValue)
+                js_value().into()
             };
 
             if *optional {
